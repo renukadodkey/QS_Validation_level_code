@@ -1,0 +1,749 @@
+WITH subject_data as    
+(select studies.org_guid AS org_guid, 
+		orgs.name AS org_name,
+		subjects.study_guid AS study_guid,
+		subjects.guid AS subject_guid,
+    studies.name AS study_name, 
+		subjects.site_guid AS site_guid,
+		sites.name AS site_name,
+		subjects.ident AS subject_name,
+		subjects.disabled as subject_status
+from subjects 
+		 JOIN studies ON studies.guid = subjects.study_guid
+		 JOIN sites ON sites.guid = subjects.site_guid 
+		 JOIN orgs ON studies.org_guid = orgs.guid
+where studies.guid = 'study_7c74606f-4cd9-40ea-ada7-e87cf2e0ee63'
+) 
+,
+--CTE to get treatment restart date and subject disabled date
+treatment_restart_event as 
+(SELECT subjects.guid AS subject_guid,
+         MIN(CASE WHEN each.key = 'customer_care_only_restart_daily_diaries' THEN (TO_TIMESTAMP (TRUNC (CAST(each.value::JSON ->> 'valueOf' AS BIGINT) / 1000)) at TIME ZONE(each.value::JSON ->> 'timezone')::VARCHAR)::DATE END) AS treatment_restart_date
+  FROM subjects ,jsonb_each (state_server_merge -> 'shared' -> 'resolvedDates') AS each
+  WHERE subjects.study_guid = 'study_7c74606f-4cd9-40ea-ada7-e87cf2e0ee63'
+  AND   each.key IN ('customer_care_only_restart_daily_diaries') 
+  GROUP BY subjects.guid)
+,
+--CTE to get visit start date
+visit_start_date as
+(select org_guid, 
+        site_guid,
+               study_guid, 
+               subject_guid,
+               site_name,
+               subject_name,
+               subject_status,
+               diary_name,
+               rule_key, 
+               visit_start_date,
+               visit_stop_date,
+               time_zone,
+               stop_rank,
+               current_timestamp at TIME ZONE(time_zone) as subject_current_date,
+               --null as subject_disabled_date
+                MAX((TO_TIMESTAMP(TRUNC (CAST(utc_time_stamp AS BIGINT) / 1000)) at TIME ZONE(time_zone)::VARCHAR))::DATE as subject_disabled_date
+               from (select subject_data.org_guid, 
+               subject_data.site_guid,
+               subject_data.study_guid,
+               response_export_desc.subject_guid,
+               site_name,
+               subject_name,
+               subject_status,
+               diary_name,
+               rule_key, 
+               Max((TO_TIMESTAMP(TRUNC (CAST(response_export_desc.completion_utc AS BIGINT) / 1000)))::TIMESTAMP) OVER (PARTITION BY response_export_desc.subject_guid ,response_export_desc.completion_utc ORDER BY response_export_desc.completion_utc) as visit_start_date,
+               null as visit_stop_date,
+               MAX(response_export_desc.completion_subject_tz) AS time_zone,
+               null as stop_rank
+        FROM subject_data
+        left join response_export_desc on subject_data.subject_guid = response_export_desc.subject_guid
+          LEFT JOIN response_export_data ON response_export_data.rec_uuid = response_export_desc.rec_uuid
+        WHERE response_export_desc.active IS true
+        and response_export_desc.deleted IS FALSE
+        AND   response_export_desc.study_guid = 'study_7c74606f-4cd9-40ea-ada7-e87cf2e0ee63'
+        AND   (rule_key LIKE ('training'))
+       GROUP BY subject_data.org_guid,
+                subject_data.site_guid, 
+               subject_data.study_guid,
+               site_name, 
+       response_export_desc.subject_guid,
+       subject_name,
+       subject_status,
+       diary_name,
+                 rule_key,
+                 response_export_desc.completion_utc)a
+       left join event_stream_migrated esm on esm.event_data_json::json ->> 'subjectGuid' = a.subject_guid
+       and esm.type = 'ALTAVOZ_SUBJECT_UPDATE'    
+       and esm.event_data_json::jsonb @> '{"updateParams": {"disabled": true}}'
+       group by org_guid,
+               site_guid, 
+               study_guid, 
+               subject_guid,
+               site_name,
+               subject_name,
+               subject_status,
+               diary_name,
+               rule_key, 
+               visit_start_date,
+               visit_stop_date,
+               time_zone,
+               stop_rank) --select * from visit_start_date where subject_guid in ('subject_9e5d9e5e-9ada-4b54-9bac-55ed3805d0bc')
+  ,
+ --CTE to get visit_end_date
+ visit_end_date as 
+ (select subject_guid,
+         subject_name,
+         diary_name,
+         rule_key, 
+         eotet_status,
+         visit_start_date,
+         visit_stop_date,
+         time_zone,
+         row_number() over(partition by subject_guid) stop_rank
+         from (select response_export_desc.subject_guid,
+               subject_name,
+               diary_name,
+               rule_key, 
+               case when value_new like '%26%' then 'End of Treatment' 
+                    when value_new like '%termination%' then 'Early Termination'
+               end as eotet_status,
+               null as visit_start_date,
+               Max((TO_TIMESTAMP(TRUNC (CAST(response_export_desc.completion_utc AS BIGINT) / 1000)))::TIMESTAMP) OVER (PARTITION BY response_export_desc.subject_guid ,response_export_desc.completion_utc ORDER BY response_export_desc.completion_utc) as visit_stop_date,
+               MAX(response_export_desc.completion_subject_tz) AS time_zone
+        FROM subject_data
+        left join response_export_desc on subject_data.subject_guid = response_export_desc.subject_guid
+          LEFT JOIN response_export_data ON response_export_data.rec_uuid = response_export_desc.rec_uuid
+        WHERE response_export_desc.active IS true
+        and response_export_desc.deleted IS FALSE
+        AND   response_export_desc.study_guid = 'study_7c74606f-4cd9-40ea-ada7-e87cf2e0ee63'
+        AND   (rule_key like '%visit_activation%') and value_new in ('week_26', 'early_termination')
+       GROUP BY response_export_desc.subject_guid,
+       subject_name,
+                 diary_name,
+                 rule_key,
+                 value_new,
+                 response_export_desc.completion_utc) as temp_0 
+                 group by 
+                 subject_guid,
+                 subject_name,
+                 diary_name,
+                 rule_key,
+                 eotet_status,
+                 visit_start_date,
+                visit_stop_date,
+                time_zone) --select * from visit_end_date
+,
+visit_start_stop as (
+select 
+visit_start_date.org_guid,
+visit_start_date.site_guid,
+visit_start_date.study_guid,
+visit_start_date.site_name,
+visit_start_date.subject_guid,
+visit_start_date.subject_status,
+visit_start_date.subject_name, 
+visit_start_date.subject_current_date::date,
+visit_start_date.visit_start_date,
+--visit_end_date.visit_stop_date,
+visit_start_date.subject_disabled_date,
+max(treatment_restart_event.treatment_restart_date) over(partition by visit_start_date.subject_guid) treatment_restart_date,
+max(visit_end_date.visit_stop_date) max_stop_date,
+min(visit_end_date.visit_stop_date) min_stop_date,
+visit_end_date.eotet_status,
+max(visit_end_date.stop_rank) max_stop_rank
+from visit_start_date
+left join visit_end_date
+on visit_start_date.subject_guid=visit_end_date.subject_guid
+left join treatment_restart_event
+on visit_start_date.subject_guid = treatment_restart_event.subject_guid
+where (visit_end_date.stop_rank is null) or (visit_end_date.stop_rank<=2)
+group by
+subject_current_date,
+visit_start_date.org_guid,
+visit_start_date.site_guid,
+visit_start_date.study_guid,
+visit_start_date.site_name,
+visit_start_date.subject_guid,
+visit_start_date.subject_status,
+visit_start_date.subject_name, 
+visit_start_date.subject_current_date,
+visit_start_date.visit_start_date,
+visit_start_date.subject_disabled_date,
+treatment_restart_event.treatment_restart_date,
+visit_end_date.eotet_status ) --select * from visit_start_stop
+,
+--CTE to get visit schedule
+scheduled_date AS
+(
+  SELECT visit_start_stop.org_guid,
+         visit_start_stop.site_guid,
+         visit_start_stop.study_guid,
+         visit_start_stop.site_name,
+         visit_start_stop.subject_guid,
+         visit_start_stop.subject_name,
+         visit_start_stop.subject_status,
+         visit_start_stop.subject_current_date,
+         visit_start_date,
+         subject_disabled_date,
+         treatment_restart_date,
+         right(TO_CHAR(max_stop_date, 'yyyy-mm-dd hh12:mi:ss AM'), 2) am_pm_check, 
+         substring(TO_CHAR(max_stop_date, 'yyyy-mm-dd hh12:mi:ss AM'), 11,3) time_chk,
+         min_stop_date,
+         max_stop_date, 
+         max_stop_rank,
+         eotet_status,   
+         GENERATE_SERIES(visit_start_date,/*coalesce(case --when subject_status=True then subject_disabled_date::date+1
+                                                        when treatment_restart_date is null and max_stop_date<(subject_current_date) then max_stop_date::date+1
+                                                        when treatment_restart_date::date >= (max_stop_date::date) then (subject_current_date::date+1)
+                                                        when treatment_restart_date::date < (max_stop_date::date) then (max_stop_date::date)+1
+                                                        end , (visit_start_date + interval '181' day))*/ subject_current_date::date+1,'1 day')::DATE AS scheduled_date
+   FROM visit_start_stop) --select * from scheduled_date --where subject_guid in ('subject_24fad3ef-4d34-4082-8258-763498bf7099')
+ ,
+--CTE to get all responses
+  response_master AS (select 
+subject_guid, 
+schedule_type , 
+to_timestamp(trunc(cast(completion_utc as bigint)/1000)) as response_completion_date, 
+widget_data_key,
+value_new
+from response_export_desc red1
+left join response_export_data red2
+on red1.rec_uuid =red2.rec_uuid 
+where red1.active IS true
+         and red1.deleted IS false
+         and red1.study_guid = 'study_7c74606f-4cd9-40ea-ada7-e87cf2e0ee63'  
+         and widget_data_key not like '%training%'
+order by subject_guid, completion_utc) 
+,
+--CTE to get epro and obsro responses
+epro_obsro_responses as
+(select subject_guid, 
+schedule_type ,  
+--response_completion_date::date as ref,
+case when widget_data_key like '%yesterday%' then (response_completion_date::date)-1 else response_completion_date::date end as response_completion_date,
+widget_data_key,
+value_new
+from response_master
+where schedule_type<>'clinro' and length(value_new)<4) 
+,
+epro_obsro_responses_modified as 
+(select subject_guid, 
+schedule_type , 
+response_completion_date::date, 
+widget_data_key,
+value_new,
+case when widget_data_key like '%am%' then value_new end as morning_response,
+case when widget_data_key like '%pm%' then value_new end as evening_response
+ from epro_obsro_responses) 
+,
+--CTE to get latest response for the day
+clinro_latest_responses as 
+(select subject_guid, 
+schedule_type, max(response_completion_date_orig) as max_response_completion_date_orig,
+response_completion_date, widget_data_key from (select subject_guid, 
+schedule_type , 
+widget_data_key,
+value_new,
+response_completion_date as response_completion_date_orig,
+case when length(value_new)>4 then to_date(value_new,'YYYY-MM-dd') end as response_completion_date,  
+lead(value_new,1) over(partition by subject_guid order by response_completion_date, value_new) as lead_value_new
+from response_master
+where schedule_type='clinro' and widget_data_key like '%site_reported%') as temp1 where length(value_new)>4 
+group by subject_guid, schedule_type, response_completion_date, widget_data_key) --select * from clinro_latest_responses where subject_guid in ('subject_5664033e-1e99-4faa-9e8f-40139be03673')
+,
+--CTE to get clinro responses
+clinro_responses as
+(select * from (select response_master.subject_guid, 
+response_master.schedule_type, 
+response_master.value_new,
+clinro_latest_responses.max_response_completion_date_orig,
+case when length(value_new)>4 then to_date(value_new,'YYYY-MM-dd') end as response_completion_date, 
+response_master.widget_data_key, 
+lead(value_new,1) over(partition by response_master.subject_guid order by response_master.response_completion_date, value_new) as lead_value_new
+from response_master
+inner join clinro_latest_responses
+on response_master.subject_guid=clinro_latest_responses.subject_guid
+and response_master.response_completion_date=clinro_latest_responses.max_response_completion_date_orig
+where response_master.schedule_type='clinro' and response_master.widget_data_key like '%site_reported%') as temp where length(value_new)>4 ) 
+,
+clinro_responses_modified as 
+(select subject_guid, 
+schedule_type , 
+response_completion_date::date, 
+widget_data_key,
+lead_value_new as value_new,
+case when widget_data_key like '%am%' then lead_value_new end as morning_response,
+case when widget_data_key like '%pm%' then lead_value_new end as evening_response
+ from clinro_responses) --select * from clinro_responses_modified where subject_guid in ('subject_5664033e-1e99-4faa-9e8f-40139be03673')
+,
+combined_responses as 
+(select * from (select * from epro_obsro_responses_modified
+UNION all
+select * from clinro_responses_modified) as temp2 order by subject_guid, response_completion_date) 
+, 
+schedule_vs_responses as 
+(select scheduled_date.org_guid,
+        scheduled_date.site_guid,
+        scheduled_date.study_guid,
+        scheduled_date.site_name,
+         scheduled_date.subject_guid,
+         scheduled_date.subject_name,
+         scheduled_date.subject_status,
+         scheduled_date.scheduled_date,
+         scheduled_date.min_stop_date,
+         scheduled_date.max_stop_date, 
+         scheduled_date.am_pm_check,
+         scheduled_date.time_chk,
+         scheduled_date.subject_disabled_date,
+         scheduled_date.treatment_restart_date,
+         scheduled_date.max_stop_rank,
+         scheduled_date.visit_start_date, 
+         scheduled_date.eotet_status,   
+         scheduled_date.subject_current_date,
+         combined_responses.schedule_type, 
+         case when schedule_type='clinro' then response_completion_date end as clinro_check_date,
+         case when schedule_type='epro' then response_completion_date  end as epro_check_date,
+         case when schedule_type='obsro' then response_completion_date  end as obsro_check_date,
+         case when schedule_type='clinro' then morning_response end as clinro_morning,
+         case when schedule_type='clinro' then evening_response end as clinro_evening,
+         case when schedule_type='epro' then morning_response end as epro_morning,
+         case when schedule_type='epro' then evening_response end as epro_evening,
+         case when schedule_type='obsro' then morning_response end as obsro_morning,
+         case when schedule_type='obsro' then evening_response end as obsro_evening,
+         combined_responses.response_completion_date::date, 
+         combined_responses.widget_data_key,
+         combined_responses.value_new,
+         combined_responses.morning_response,
+         combined_responses.evening_response
+         from scheduled_date
+         left join combined_responses
+         on scheduled_date.subject_guid=combined_responses.subject_guid
+         and scheduled_date.scheduled_date=combined_responses.response_completion_date) 
+/*Try getting the responses grouped, then add the dates from respective tables to reduce complexity*/
+--CTE for grouping participant responses for each date
+,
+schedule_vs_responses_grouped as
+(select org_guid,
+schedule_vs_responses.site_guid,
+schedule_vs_responses.study_guid,
+site_name, 
+subject_guid, 
+        subject_name,
+        subject_status,
+        subject_current_date,
+        visit_start_date,
+        min(min_stop_date) as min_stop_date ,
+        max(max_stop_date) as max_stop_date,
+        last_value(am_pm_check) over( partition by subject_name order by scheduled_date) am_pm_check,
+        last_value(time_chk) over (partition by subject_name order by scheduled_date) time_check,
+        max(subject_disabled_date) over (partition by subject_name order by scheduled_date) subject_disabled_date,
+        treatment_restart_date,
+        max_stop_rank as max_stop_rank_check,
+        max(max_stop_rank) as max_stop_rank,
+        eotet_status, 
+        --schedule_type,
+        scheduled_date,
+        response_completion_date,
+        max(morning_response) morning_response, 
+        max(evening_response) evening_response,
+        max(clinro_check_date) clinro_check_date ,
+        max(clinro_morning) clinro_morning,
+        max(clinro_evening) clinro_evening, 
+        max(epro_check_date) epro_check_date , 
+        max(epro_morning) epro_morning, 
+        max(epro_evening) epro_evening, 
+        max(obsro_check_date) obsro_check_date, 
+        max(obsro_morning) obsro_morning, 
+        max(obsro_evening) obsro_evening 
+        from schedule_vs_responses 
+        where scheduled_date<=(current_date::date)
+        group by org_guid,
+                 schedule_vs_responses.site_guid,
+                 schedule_vs_responses.study_guid,
+                 site_name, 
+                 subject_guid,
+                 subject_name,
+                 subject_status, 
+                 treatment_restart_date,
+                 visit_start_date, 
+                 eotet_status,  
+                 max_stop_rank, 
+                 subject_current_date,
+                 scheduled_date,
+                 subject_disabled_date,
+                 response_completion_date,
+                 schedule_vs_responses.am_pm_check, 
+                 time_chk             
+        order by subject_guid, scheduled_date) --select * from schedule_vs_responses_grouped where subject_guid in ('subject_9e5d9e5e-9ada-4b54-9bac-55ed3805d0bc')
+/*Compare morning and evening responses individually and give priority to clinro and then latest one*/
+,
+compliance_details as (select
+        schedule_vs_responses_grouped.org_guid, 
+        schedule_vs_responses_grouped.site_guid,
+        schedule_vs_responses_grouped.study_guid,
+        schedule_vs_responses_grouped.site_name,
+        schedule_vs_responses_grouped.subject_guid, 
+        schedule_vs_responses_grouped.subject_name,
+        schedule_vs_responses_grouped.subject_status,
+        schedule_vs_responses_grouped.scheduled_date,
+        schedule_vs_responses_grouped.response_completion_date,
+        schedule_vs_responses_grouped.subject_current_date,
+        schedule_vs_responses_grouped.visit_start_date,
+        case when subject_disabled_date is not null then subject_disabled_date else max_stop_date end as max_stop_date, /*to consider disabled date as stop date*/
+        --max_stop_date,
+        subject_disabled_date,
+        case when scheduled_date::date=schedule_vs_responses_grouped.max_stop_date::date then max_stop_date::date
+             when scheduled_date::date=schedule_vs_responses_grouped.subject_disabled_date::date then subject_disabled_date::date
+             when scheduled_date::date>=schedule_vs_responses_grouped.subject_disabled_date::date then subject_disabled_date::date
+         end as visit_stop_date,
+        am_pm_check,
+        time_check,
+        min(schedule_vs_responses_grouped.min_stop_date) over(partition by schedule_vs_responses_grouped.subject_guid) min_stop_date,
+        max(schedule_vs_responses_grouped.max_stop_rank)over(partition by schedule_vs_responses_grouped.subject_guid) max_stop_rank,
+        max(schedule_vs_responses_grouped.treatment_restart_date) over(partition by schedule_vs_responses_grouped.subject_guid)  as max_treatment_restart_date, 
+        case when scheduled_date::date=schedule_vs_responses_grouped.min_stop_date::date then schedule_vs_responses_grouped.eotet_status end as min_eotet_status,
+        case when scheduled_date::date=schedule_vs_responses_grouped.max_stop_date::date then schedule_vs_responses_grouped.eotet_status end as max_eotet_status,
+        case when scheduled_date::date= schedule_vs_responses_grouped.treatment_restart_date::date then schedule_vs_responses_grouped.treatment_restart_date::date end as treatment_restart_date,
+        case when schedule_vs_responses_grouped.clinro_morning is not null then initcap(schedule_vs_responses_grouped.clinro_morning)
+             else
+             case when schedule_vs_responses_grouped.morning_response is not null then initcap(schedule_vs_responses_grouped.morning_response) end
+        end as morning_response,
+        case when schedule_vs_responses_grouped.clinro_evening is not null then initcap(schedule_vs_responses_grouped.clinro_evening)
+             else
+             case when schedule_vs_responses_grouped.evening_response is not null then initcap(schedule_vs_responses_grouped.evening_response) end
+        end as evening_response, 
+       -- 2 as expected_response_count,
+        schedule_vs_responses_grouped.clinro_check_date ,
+        schedule_vs_responses_grouped.clinro_morning,
+        schedule_vs_responses_grouped.clinro_evening, 
+        schedule_vs_responses_grouped.epro_check_date, 
+        schedule_vs_responses_grouped.epro_morning, 
+        schedule_vs_responses_grouped.epro_evening, 
+        schedule_vs_responses_grouped.obsro_check_date, 
+        schedule_vs_responses_grouped.obsro_morning, 
+        schedule_vs_responses_grouped.obsro_evening
+        from schedule_vs_responses_grouped
+where scheduled_date<=subject_current_date::date) --select * from compliance_details where subject_guid in ('subject_9e5d9e5e-9ada-4b54-9bac-55ed3805d0bc')
+,
+compliance_details2 as
+(select 
+org_guid as "Org GUID",
+site_guid as "Site GUID",
+study_guid as "Study GUID",
+site_name,
+subject_guid, 
+subject_name, 
+case when subject_status is True then 'Disabled' else 'Active' end as subject_status,
+subject_current_date,
+scheduled_date, 
+case when (row_number() over(partition by subject_guid order by scheduled_date))%7<>0 then ((row_number() over(partition by subject_guid order by scheduled_date))/7)+1
+     else (row_number() over(partition by subject_guid order by scheduled_date))/7
+end as week_num,
+row_number() over(partition by subject_guid order by scheduled_date) day_num,
+visit_start_date,
+visit_stop_date, 
+subject_disabled_date,
+max_stop_date,
+max_stop_rank,
+min_eotet_status,
+max_eotet_status,
+case when scheduled_date::date = max_treatment_restart_date::date then 'Customer Care Event' 
+     when scheduled_date::date = subject_disabled_date::date then 'Disabled'
+     when min_eotet_status is not null then concat(min_eotet_status,' 1')
+     when max_eotet_status is not null then concat(max_eotet_status,' 2')
+end as comment,
+max_treatment_restart_date,
+response_completion_date, 
+morning_response,
+/*case when the dose treatment is ongoing and was never stopped
+case when the dose treatment has been stopped but never restarted
+case when the dose treatment has been stopped but was restarted
+case when the dose treatment has been stopped once, then restarted and stopped again*/
+CASE WHEN max_stop_date::date is null and (max_stop_rank is null or max_stop_rank<=2) then
+     CASE WHEN morning_response='Yes' and scheduled_date::date<=(subject_current_date::date) then 'Yes'
+          WHEN morning_response='No' and scheduled_date::date<=(subject_current_date::date) then 'No'
+          WHEN morning_response IS NULL and scheduled_date::date<(subject_current_date::date) THEN 'Missed'
+          WHEN morning_response IS NULL and scheduled_date::date=(subject_current_date::date) THEN 'Pending'
+     END
+     WHEN  max_stop_date::date is NOT null and (max_stop_rank is null or max_stop_rank<=2) then 
+     CASE WHEN max_treatment_restart_date::date IS NULL then
+          case when scheduled_date::date>max_stop_date::date then 'Exclude' 
+               WHEN morning_response='Yes' and scheduled_date::date<max_stop_date::date then 'Yes'
+               WHEN morning_response='Yes' and scheduled_date::date=max_stop_date::date then 'Yes'
+                WHEN morning_response='No' and scheduled_date::date<=max_stop_date::date then 'No'
+                WHEN morning_response IS NULL and scheduled_date::date<max_stop_date::date THEN 'Missed'
+                WHEN morning_response is not null and scheduled_date::date=max_stop_date::date and subject_status=True then initcap(morning_response)
+                WHEN morning_response is null and evening_response IS NOT NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'Missed'
+                WHEN morning_response is null and evening_response IS NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'NA'
+                WHEN morning_response IS NULL and scheduled_date::date=max_stop_date::date and am_pm_check='PM' THEN 'NA'
+                WHEN morning_response IS NULL and scheduled_date::date=max_stop_date::date and am_pm_check='AM' THEN 'NA'
+                else 'NA'
+          END
+         WHEN max_treatment_restart_date::date IS NOT NULL then
+          CASE WHEN max_treatment_restart_date::date>=max_stop_date::date and max_stop_rank<=2 THEN
+              CASE WHEN morning_response='Yes' and scheduled_date::date<=(subject_current_date::date) then 'Yes'
+                    WHEN morning_response='No' and scheduled_date::date<=(subject_current_date::date) then 'No'
+                    WHEN morning_response IS NULL and scheduled_date::date<(subject_current_date::date) THEN 'Missed'
+                    WHEN morning_response IS NULL and scheduled_date::date=(subject_current_date::date) THEN 'Pending'
+                    WHEN morning_response is not null and scheduled_date::date=max_stop_date::date and subject_status=True then initcap(morning_response)
+                    WHEN morning_response is null and evening_response IS NOT NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'Missed'
+                    WHEN morning_response is null and evening_response IS NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'NA'
+              END
+               WHEN max_treatment_restart_date::date<max_stop_date::date and max_stop_rank<=2 THEN
+               case when scheduled_date::date>max_stop_date::date then 'Exclude' 
+                    WHEN morning_response='Yes' and scheduled_date::date<max_stop_date::date then 'Yes'
+                   WHEN morning_response='Yes' and scheduled_date::date=max_stop_date::date then 'Yes'
+                    WHEN morning_response='No' and scheduled_date::date<=max_stop_date::date then 'No'
+                    WHEN morning_response IS NULL and scheduled_date::date<max_stop_date::date THEN 'Missed'
+                    WHEN morning_response is not null and scheduled_date::date=max_stop_date::date and subject_status=True then initcap(morning_response)
+                    WHEN morning_response is null and evening_response IS NOT NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'Missed'
+                    WHEN morning_response is null and evening_response IS NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'NA'
+                     WHEN morning_response IS NULL and scheduled_date::date=max_stop_date::date and am_pm_check='PM' THEN 'NA'
+                     WHEN morning_response IS NULL and scheduled_date::date=max_stop_date::date and am_pm_check='AM' THEN 'NA'
+                    else 'NA'
+              END
+          END
+      else 'NA'
+      END
+   else 'NA' 
+END as morning_response_updated,        
+evening_response,
+am_pm_check,
+time_check,
+CASE WHEN max_stop_date::date is null and (max_stop_rank is null or max_stop_rank<=2) then
+     CASE WHEN evening_response='Yes' and scheduled_date::date<=(subject_current_date::date) then 'Yes'
+          WHEN evening_response='No' and scheduled_date::date<=(subject_current_date::date) then 'No'
+          WHEN evening_response IS NULL and scheduled_date::date<(subject_current_date::date) THEN 'Missed'
+          WHEN evening_response IS NULL and scheduled_date::date=(subject_current_date::date) THEN 'Pending'
+     END
+     WHEN  max_stop_date::date is NOT null and (max_stop_rank is null or max_stop_rank<=2) then 
+     CASE WHEN max_treatment_restart_date IS NULL then
+          case when scheduled_date::date>max_stop_date::date then 'Exclude' 
+               WHEN evening_response='Yes' and scheduled_date::date<max_stop_date::date then 'Yes'
+               WHEN evening_response is not null and scheduled_date::date=max_stop_date::date and subject_status=True then initcap(evening_response)
+               WHEN evening_response is null and morning_response IS NOT NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'NA'
+               WHEN evening_response is null and morning_response IS NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'NA'
+               WHEN evening_response='Yes' and scheduled_date::date=max_stop_date::date and am_pm_check='PM'  then 'Yes'
+               WHEN evening_response='No' and scheduled_date::date<max_stop_date::date then 'No'
+               WHEN evening_response='No' and scheduled_date::date=max_stop_date::date and am_pm_check='PM' then 'No'
+                WHEN evening_response IS NULL and scheduled_date::date<max_stop_date::date THEN 'Missed'
+                WHEN evening_response IS NULL and scheduled_date::date=max_stop_date::date and am_pm_check='PM' THEN 'NA'
+                WHEN evening_response IS NULL and scheduled_date::date=max_stop_date::date and am_pm_check='AM' THEN 'NA'
+                else 'NA'
+          END
+         WHEN max_treatment_restart_date IS NOT NULL and max_stop_rank<=2 then
+          CASE WHEN max_treatment_restart_date::date>=max_stop_date::date THEN
+              CASE WHEN evening_response='Yes' and scheduled_date::date<=(subject_current_date::date) then 'Yes'
+                    WHEN evening_response='No' and scheduled_date::date<=(subject_current_date::date) then 'No'
+                    WHEN evening_response IS NULL and scheduled_date::date<(subject_current_date::date) THEN 'Missed'
+                    WHEN evening_response IS NULL and scheduled_date::date=(subject_current_date::date) THEN 'Pending'
+                    WHEN evening_response is not null and scheduled_date::date=max_stop_date::date and subject_status=True then initcap(evening_response)
+                    WHEN evening_response is null and morning_response IS NOT NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'NA'
+                    WHEN evening_response is null and morning_response IS NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'NA'
+              END
+               WHEN max_treatment_restart_date::date<max_stop_date::date and max_stop_rank<=2 THEN
+               case when scheduled_date::date>max_stop_date::date then 'Exclude'
+                   WHEN evening_response='Yes' and scheduled_date::date<max_stop_date::date then 'Yes'
+                   WHEN evening_response is not null and scheduled_date::date=max_stop_date::date and subject_status=True then initcap(morning_response)
+                   WHEN evening_response is null and morning_response IS NOT NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'NA'
+                   WHEN evening_response is null and morning_response IS NULL AND  scheduled_date::date=max_stop_date::date and subject_status=True then 'NA'
+                   WHEN evening_response='Yes' and scheduled_date::date=max_stop_date::date and am_pm_check='PM' then 'Yes'
+                   WHEN evening_response='No' and scheduled_date::date<max_stop_date::date then 'No'
+                   WHEN evening_response='No' and scheduled_date::date<=max_stop_date::date and am_pm_check='PM' then 'No'
+                   WHEN evening_response IS NULL and scheduled_date::date<max_stop_date::date THEN 'Missed'
+                   WHEN evening_response IS NULL and scheduled_date::date=max_stop_date::date and am_pm_check='PM' THEN 'NA'
+                   WHEN evening_response IS NULL and scheduled_date::date=max_stop_date::date and am_pm_check='AM' THEN 'NA'
+                   else 'NA'
+              END
+          END
+      else 'NA'
+      END
+   else 'NA' 
+END as evening_response_updated, 
+--expected_response_count,
+CASE WHEN max_stop_date::date is null then
+      CASE when morning_response is not null and evening_response is not null then 2
+          when morning_response is null and evening_response is not null and scheduled_date::date<subject_current_date::date then 2
+          when morning_response is not null and evening_response is null and scheduled_date::date<subject_current_date::date then 2
+          when morning_response is null and evening_response is null and scheduled_date::date<>subject_current_date::date then 2
+          when morning_response is null and evening_response is null and scheduled_date::date=subject_current_date::date then 0
+          else 0
+     END
+     WHEN  max_stop_date::date is NOT null then 
+     CASE WHEN max_treatment_restart_date::date IS NULL then
+          CASE WHEN  morning_response is not null and evening_response is not null and scheduled_date::date<=max_stop_date::date then 2
+                WHEN morning_response is null and evening_response is not null and scheduled_date::date<max_stop_date::date then 2
+                WHEN morning_response is not null and evening_response is null and scheduled_date::date<max_stop_date::date THEN 2
+                WHEN morning_response is null and evening_response is null and scheduled_date::date<max_stop_date::date THEN 2
+                WHEN morning_response is NOT null and evening_response is null and scheduled_date::date=max_stop_date::date THEN 1
+                WHEN morning_response is null and evening_response is NOT null and scheduled_date::date=max_stop_date::date THEN 1
+                WHEN morning_response is null and evening_response is null and scheduled_date::date=max_stop_date::date THEN 0
+                else 0
+          END
+         WHEN max_treatment_restart_date::date IS NOT NULL then
+          CASE WHEN max_treatment_restart_date::date>=max_stop_date::date THEN 2
+               WHEN max_treatment_restart_date::date<max_stop_date::date THEN
+                   CASE WHEN  morning_response is not null and evening_response is not null and scheduled_date::date<=max_stop_date::date then 2
+		                WHEN morning_response is null and evening_response is not null and scheduled_date::date<max_stop_date::date then 2
+		                WHEN morning_response is not null and evening_response is null and scheduled_date::date<max_stop_date::date THEN 2
+		                WHEN morning_response is null and evening_response is null and scheduled_date::date<max_stop_date::date THEN 2
+		                WHEN morning_response is null and evening_response is null and scheduled_date::date=max_stop_date::date THEN 2
+                            else 0
+                   END
+               else 0
+          END
+      else 0
+      END 
+else 0
+END AS expected_response_count,
+CASE WHEN max_stop_date::date is null then
+   case when morning_response='Yes' and evening_response='Yes' then 2
+      when morning_response='Yes' and (evening_response='No' or evening_response is null) then 1
+      when (morning_response='No' or morning_response is null) and evening_response='Yes' then 1
+      else 0
+    end 
+    WHEN  max_stop_date::date is NOT null then 
+     CASE WHEN max_treatment_restart_date::date IS NULL then
+          CASE WHEN  morning_response='Yes' and evening_response='Yes' and scheduled_date::date<=max_stop_date::date then 2
+                WHEN (morning_response='No' or morning_response is null) and evening_response='Yes' and scheduled_date::date<max_stop_date::date then 1
+                WHEN morning_response='Yes' and (evening_response='No' or evening_response is null) and scheduled_date::date<max_stop_date::date THEN 1
+                WHEN (morning_response='No' or morning_response is null) and (evening_response='No' or evening_response is null) and scheduled_date::date<=max_stop_date::date THEN 0
+                else 0
+          END
+          WHEN max_treatment_restart_date::date IS NOT NULL then
+          CASE WHEN max_treatment_restart_date::date>=max_stop_date::date THEN
+              CASE when morning_response='Yes' and evening_response='Yes' then 2
+                    when (morning_response='No' or morning_response is null) and evening_response='Yes' and scheduled_date::date<>subject_current_date::date then 1
+                    when morning_response='Yes' and (evening_response='No' or evening_response is null) and scheduled_date::date<>subject_current_date::date then 1
+                    when (morning_response='No' or morning_response is null) and (evening_response='No' or evening_response is null) and scheduled_date::date<=subject_current_date::date then 0
+                    else 0
+              END
+               WHEN max_treatment_restart_date::date<max_stop_date::date THEN
+              CASE WHEN  morning_response='Yes' and evening_response='Yes' and scheduled_date::date<=max_stop_date::date then 2
+                WHEN (morning_response='No' or morning_response is null) and evening_response='Yes' and scheduled_date::date<max_stop_date::date then 1
+                WHEN morning_response='Yes' and (evening_response='No' or evening_response is null) and scheduled_date::date<max_stop_date::date THEN 1
+                WHEN (morning_response='No' or morning_response is null) and (evening_response='No' or evening_response is null) and scheduled_date::date<=max_stop_date::date THEN 0
+                else 0
+              END
+            else 0
+          END
+        else 0  
+      END 
+ else 0
+end as completed_response_count,
+/*Missed Response Count
+-case when the dose treatment is ongoing and was never stopped
+-case when the dose treatment has been stopped but never restarted
+-case when the dose treatment has been stopped but was restarted
+-case when the dose treatment has been stopped once, then restarted and stopped again*/
+CASE WHEN max_stop_date::date is null then
+     CASE when morning_response is not null and evening_response is not null then 0
+          when morning_response is null and evening_response is not null and scheduled_date::date<>subject_current_date::date then 1
+          when morning_response is not null and evening_response is null and scheduled_date::date<>subject_current_date::date then 1
+          when morning_response is null and evening_response is null and scheduled_date::date<>subject_current_date::date then 2
+          else 0
+     END
+     WHEN  max_stop_date::date is NOT null then 
+     CASE WHEN max_treatment_restart_date::date IS NULL then
+          CASE WHEN  morning_response is not null and evening_response is not null and scheduled_date::date<=max_stop_date::date then 0
+                WHEN morning_response is null and evening_response is not null and scheduled_date::date<max_stop_date::date then 1
+                WHEN morning_response is not null and evening_response is null and scheduled_date::date<max_stop_date::date THEN 1
+                WHEN morning_response is null and evening_response is null and scheduled_date::date<max_stop_date::date THEN 2
+                WHEN morning_response is null and evening_response is null and scheduled_date::date=max_stop_date::date THEN 0
+                else 0
+          END
+         WHEN max_treatment_restart_date::date IS NOT NULL then
+          CASE WHEN max_treatment_restart_date::date>=max_stop_date::date THEN
+              CASE when morning_response is not null and evening_response is not null then 0
+                    when morning_response is null and evening_response is not null and scheduled_date::date<>subject_current_date::date then 1
+                    when morning_response is not null and evening_response is null and scheduled_date::date<>subject_current_date::date then 1
+                    when morning_response is null and evening_response is null and scheduled_date::date<>subject_current_date::date then 2
+                    else 0
+              END
+               WHEN max_treatment_restart_date::date<max_stop_date::date THEN
+              CASE WHEN  morning_response is not null and evening_response is not null and scheduled_date::date<=max_stop_date::date then 0
+                    WHEN morning_response is null and evening_response is not null and scheduled_date::date<max_stop_date::date then 1
+                    WHEN morning_response is not null and evening_response is null and scheduled_date::date<max_stop_date::date THEN 1
+                    WHEN morning_response is null and evening_response is null and scheduled_date::date<max_stop_date::date THEN 2
+                    WHEN morning_response is null and evening_response is null and scheduled_date::date=max_stop_date::date THEN 0
+                    else 0
+              END
+            else 0
+          END
+        else 0  
+      END 
+ else 0
+END as missed_response_count,
+CASE WHEN max_stop_date::date is null then
+   case when morning_response='No' and evening_response='No' then 2
+      when morning_response='No' and (evening_response='Yes' or evening_response is null) then 1
+      when (morning_response='Yes' or morning_response is null) and evening_response='No' then 1
+      else 0
+    end 
+    WHEN  max_stop_date::date is NOT null then 
+     CASE WHEN max_treatment_restart_date::date IS NULL then
+          CASE WHEN  morning_response='No' and evening_response='No' and scheduled_date::date<=max_stop_date::date then 2
+                WHEN (morning_response='Yes' or morning_response is null) and evening_response='No' and scheduled_date::date<max_stop_date::date then 1
+                WHEN morning_response='No' and (evening_response='Yes' or evening_response is null) and scheduled_date::date<max_stop_date::date THEN 1
+                WHEN (morning_response='Yes' or morning_response is null) and (evening_response='Yes' or evening_response is null) and scheduled_date::date<=max_stop_date::date THEN 0
+                else 0
+          END
+          WHEN max_treatment_restart_date::date IS NOT NULL then
+          CASE WHEN max_treatment_restart_date::date>=max_stop_date::date THEN
+              CASE when morning_response='No' and evening_response='No' then 2
+                    when (morning_response='Yes' or morning_response is null) and evening_response='No' and scheduled_date::date<>subject_current_date::date then 1
+                    when morning_response='No' and (evening_response='Yes' or evening_response is null) and scheduled_date::date<>subject_current_date::date then 1
+                    when (morning_response='Yes' or morning_response is null) and (evening_response='Yes' or evening_response is null) and scheduled_date::date<=subject_current_date::date then 0
+                    else 0
+              END
+               WHEN max_treatment_restart_date::date<max_stop_date::date THEN
+              CASE WHEN  morning_response='No' and evening_response='No' and scheduled_date::date<=max_stop_date::date then 2
+                WHEN (morning_response='Yes' or morning_response is null) and evening_response='No' and scheduled_date::date<max_stop_date::date then 1
+                WHEN morning_response='No' and (evening_response='Yes' or evening_response is null) and scheduled_date::date<max_stop_date::date THEN 1
+                WHEN (morning_response='Yes' or morning_response is null) and (evening_response='Yes' or evening_response is null) and scheduled_date::date<=max_stop_date::date THEN 0
+                else 0
+              END
+            else 0
+          END
+        else 0  
+      END 
+ else 0
+end as response_asno_count,
+NOW() as data_refresh_time
+from compliance_details order by site_name, subject_name,scheduled_date,day_num) 
+select 
+"Org GUID",
+"Site GUID",
+"Study GUID",
+site_name,
+subject_guid, 
+subject_name, 
+subject_status,
+subject_current_date,
+scheduled_date, 
+week_num,
+day_num,
+visit_start_date,
+visit_stop_date, 
+max_stop_date,
+max_stop_rank,
+min_eotet_status,
+comment,
+max_treatment_restart_date,
+response_completion_date, 
+am_pm_check,
+time_check,
+morning_response,
+morning_response_updated,        
+evening_response,
+ evening_response_updated, 
+expected_response_count as expected_response_count_updated,
+sum(expected_response_count) over(partition by subject_name order by scheduled_date asc)expected_response_count_running,
+sum(completed_response_count) over(partition by subject_name order by scheduled_date asc)completed_response_count_running,
+sum(missed_response_count) over(partition by subject_name order by scheduled_date asc)missed_response_count_running,
+sum(response_asno_count) over(partition by subject_name order by scheduled_date asc)response_asno_count_updated_running,
+completed_response_count,
+missed_response_count,
+response_asno_count,
+data_refresh_time
+from compliance_details2 order by site_name, subject_name, scheduled_date
