@@ -1,0 +1,450 @@
+----------------------------study_133120dc-921f-462f-8797-5deb609c9c2a--------------------------
+with illness_start_date  /*to have illness start date for participants*/
+as (  
+select distinct
+rdes.study_guid as study_guid,
+o.guid as org_guid,
+o.name as org_name,
+s.guid as site_guid,
+s.name as site_name,
+s.country_code as country,
+rdes.subject_guid as subject_guid,
+sub.ident as subject_name,
+each.key as illnesstart,
+concat('Illness ',substring(each.key,strpos(each.key,'y')+2,2)) as illness,
+substring(each.key,strpos(each.key,'y')+2,2) as illness_event,
+((TO_TIMESTAMP (TRUNC (cast(each.value::JSON ->> 'valueOf' as BIGINT) / 1000)) at TIME zone(each.value::JSON ->> 'timezone')::VARCHAR)::DATE) as illness_start_date
+from response_export_desc rdes
+inner join response_export_data rd ON rd.rec_uuid=rdes.rec_uuid
+inner join subjects sub on sub.guid  =rdes.subject_guid
+inner join sites s on s.guid =sub.site_guid
+inner join orgs o on o.guid =s.org_guid,
+jsonb_each (state_server_merge -> 'shared' -> 'resolvedDates') as each
+where rdes.study_guid ='study_133120dc-921f-462f-8797-5deb609c9c2a'
+and sub.disabled=false
+and rdes.deleted = false and rdes.active = true
+and each.key like ('%start_illness_e_diary_%')
+)--select * from illness_start_date
+,
+illness_all_data  /*all the ediaries filled by participants*/
+ as (
+select distinct
+rdes.study_guid as study_guid,
+o.guid as org_guid,
+o.name as org_name,
+s.guid as site_guid,
+s.name as site_name,
+rdes.subject_guid as subject_guid,
+sub.ident as subject_name,
+rule_name,
+rule_key,
+diary_name,
+max(((to_timestamp(trunc(cast(rdes.start_utc as bigint)/1000)) at TIME ZONE rdes.start_subject_tz)::DATE)) over (partition by sub.ident,rule_key) as last_ediary_date,
+min(((to_timestamp(trunc(cast(rdes.start_utc as bigint)/1000)) at TIME ZONE rdes.start_subject_tz)::DATE)) over (partition by sub.ident,rule_key)  as first_ediary_date,
+((to_timestamp(trunc(cast(rdes.start_utc as bigint)/1000)) at TIME ZONE rdes.start_subject_tz)::DATE) as illness_ediary_date
+from response_export_desc rdes
+inner join response_export_data rd ON rd.rec_uuid=rdes.rec_uuid
+inner join subjects sub on sub.guid  =rdes.subject_guid
+inner join sites s on s.guid =sub.site_guid
+inner join orgs o on o.guid =s.org_guid
+where rdes.study_guid ='study_133120dc-921f-462f-8797-5deb609c9c2a'
+and sub.disabled=false
+and rule_key like ('%illness_%')
+group by 
+rdes.study_guid,
+o.guid,
+o.name,
+s.guid,
+s.name,
+rdes.subject_guid,
+sub.ident,
+rule_name,
+rule_key,
+diary_name,
+rdes.start_utc,
+rdes.start_subject_tz
+) --select * from illness_all_data
+,
+illness_day_data /*creating day_1 to day_16 for the participants*/
+as (
+select 
+study_guid,
+org_guid,
+org_name,
+site_guid,
+site_name,
+country,
+subject_guid,
+subject_name,
+illnesstart,
+illness,
+illness_event,
+illness_start_date,
+illness_start_date as day_1,
+(illness_start_date + interval '1 day')::date as day_2,
+(illness_start_date + interval '2 day')::date as day_3,
+(illness_start_date + interval '3 day')::date as day_4,
+(illness_start_date + interval '4 day')::date as day_5,
+(illness_start_date + interval '5 day')::date as day_6,
+(illness_start_date + interval '6 day')::date as day_7,
+(illness_start_date + interval '7 day')::date as day_8,
+(illness_start_date + interval '8 day')::date as day_9,
+(illness_start_date + interval '9 day')::date as day_10,
+(illness_start_date + interval '10 day')::date as day_11,
+(illness_start_date + interval '11 day')::date as day_12,
+(illness_start_date + interval '12 day')::date as day_13,
+(illness_start_date + interval '13 day')::date as day_14
+from illness_start_date
+),
+all_training_data  /*getting training records for the participants*/
+as (
+select distinct
+rdes.study_guid as study_guid,
+o.guid as org_guid,
+o.name as org_name,
+s.guid as site_guid,
+s.name as site_name,
+rdes.subject_guid as subject_guid,
+sub.ident as subject_name,
+rule_name,
+rule_key,
+diary_name,
+((to_timestamp(trunc(cast(rdes.start_utc as bigint)/1000)) at TIME ZONE rdes.start_subject_tz)::DATE) as training_date
+from response_export_desc rdes
+inner join response_export_data rd ON rd.rec_uuid=rdes.rec_uuid
+inner join subjects sub on sub.guid  =rdes.subject_guid
+inner join sites s on s.guid =sub.site_guid
+inner join orgs o on o.guid =s.org_guid
+where rdes.study_guid ='study_133120dc-921f-462f-8797-5deb609c9c2a'
+and sub.disabled=false
+and rule_key like ('%training%')
+) --select * from all_training_data
+,
+training_data_all /*counting training records for participants and getting the last training record for the participants*/
+as (
+select distinct
+study_guid,
+org_guid,
+org_name,
+site_guid,
+site_name,
+subject_guid,
+subject_name,
+diary_name,
+count(training_date) over (partition by subject_name) as training_count,
+max(training_date)  over (partition by subject_name) as last_training_date
+from all_training_data 
+group by 
+study_guid,
+org_guid,
+org_name,
+site_guid,
+site_name,
+subject_guid,
+subject_name,
+diary_name,
+training_date
+),
+illness_stop_date /*to get illness stop date for participants*/
+as (
+select distinct
+rdes.study_guid as study_guid,
+o.guid as org_guid,
+o.name as org_name,
+s.guid as site_guid,
+s.name as site_name,
+rdes.subject_guid as subject_guid,
+sub.ident as subject_name,
+each.key as illnessstop,
+substring(each.key,strpos(each.key,'y')+2,2)  as stop_event,
+to_char(((TO_TIMESTAMP (TRUNC (cast(each.value::JSON ->> 'valueOf' as BIGINT) / 1000)) at TIME zone(each.value::JSON ->> 'timezone')::VARCHAR)::DATE),'Month')::text as completed_month,
+((TO_TIMESTAMP (TRUNC (cast(each.value::JSON ->> 'valueOf' as BIGINT) / 1000)) at TIME zone(each.value::JSON ->> 'timezone')::VARCHAR)::DATE) as stop_illness_date
+from response_export_desc rdes
+inner join response_export_data rd ON rd.rec_uuid=rdes.rec_uuid
+inner join subjects sub on sub.guid  =rdes.subject_guid
+inner join sites s on s.guid =sub.site_guid
+inner join orgs o on o.guid =s.org_guid,
+jsonb_each (state_server_merge -> 'shared' -> 'resolvedDates') as each
+where rdes.study_guid ='study_133120dc-921f-462f-8797-5deb609c9c2a'
+and sub.disabled=false
+and rdes.deleted = false and rdes.active = true
+and each.key like ('%stop_illness_e_diary_%')
+) --select * from illness_stop_date
+,
+report_data /*getting together all the data for all the participants*/
+as (
+select distinct 
+idd.study_guid,
+idd.org_guid,
+idd.org_name,
+idd.site_guid,
+idd.site_name,
+idd.country,
+idd.subject_guid,
+idd.subject_name,
+idd.illnesstart,
+idd.illness,
+idd.illness_event,
+idd.illness_start_date,
+idd.day_1,
+idd.day_2,
+idd.day_3,
+idd.day_4,
+idd.day_5,
+idd.day_6,
+idd.day_7,
+idd.day_8,
+idd.day_9,
+idd.day_10,
+idd.day_11,
+idd.day_12,
+idd.day_13,
+idd.day_14,
+tda.last_training_date,
+tda.training_count,
+iad.first_ediary_date,
+iad.last_ediary_date,
+isd.stop_illness_date,
+isd.completed_month,
+(case when isd.stop_illness_date is not null and isd.stop_illness_date <= day_14 then stop_illness_date
+when isd.stop_illness_date is not null and isd.stop_illness_date >= day_14 then day_14
+when isd.stop_illness_date is null and day_14 < current_date then day_14
+else null end ) as stop_illness_date_1,
+max (case when illness_ediary_date = day_1 then illness_ediary_date else null end) as illness_day_1,
+max (case when illness_ediary_date = day_2 then illness_ediary_date else null end) as illness_day_2,
+max (case when illness_ediary_date = day_3 then illness_ediary_date else null end) as illness_day_3,
+max (case when illness_ediary_date = day_4 then illness_ediary_date else null end) as illness_day_4,
+max (case when illness_ediary_date = day_5 then illness_ediary_date else null end) as illness_day_5,
+max (case when illness_ediary_date = day_6 then illness_ediary_date else null end) as illness_day_6,
+max (case when illness_ediary_date = day_7 then illness_ediary_date else null end) as illness_day_7,
+max (case when illness_ediary_date = day_8 then illness_ediary_date else null end) as illness_day_8,
+max (case when illness_ediary_date = day_9 then illness_ediary_date else null end) as illness_day_9,
+max (case when illness_ediary_date = day_10 then illness_ediary_date else null end) as illness_day_10,
+max (case when illness_ediary_date = day_11 then illness_ediary_date else null end) as illness_day_11,
+max (case when illness_ediary_date = day_12 then illness_ediary_date else null end) as illness_day_12,
+max (case when illness_ediary_date = day_13 then illness_ediary_date else null end) as illness_day_13,
+max (case when illness_ediary_date = day_14 then illness_ediary_date else null end) as illness_day_14
+from illness_day_data idd
+left join illness_all_data iad on (
+idd.study_guid     =    iad.study_guid    and
+idd.org_guid	   =    iad.org_guid	  and
+idd.org_name	   =	iad.org_name      and
+idd.site_guid	   =	iad.site_guid     and
+idd.site_name      =	iad.site_name     and
+idd.subject_guid   =    iad.subject_guid  and
+idd.subject_name   =    iad.subject_name  and
+idd.illness		   =    case when (right(iad.rule_name,1)<>'L') then iad.rule_name else left(iad.rule_name,-4) end 
+)
+left join training_data_all tda on (
+idd.study_guid     =    tda.study_guid    and
+idd.org_guid	   =    tda.org_guid	  and
+idd.org_name	   =	tda.org_name      and
+idd.site_guid	   =	tda.site_guid     and
+idd.site_name      =	tda.site_name     and
+idd.subject_guid   =    tda.subject_guid  and
+idd.subject_name   =    tda.subject_name
+)
+left join illness_stop_date isd on (
+idd.study_guid     =    isd.study_guid    and
+idd.org_guid	   =    isd.org_guid	  and
+idd.org_name	   =	isd.org_name      and
+idd.site_guid	   =	isd.site_guid     and
+idd.site_name      =	isd.site_name     and
+idd.subject_guid   =    isd.subject_guid  and
+idd.subject_name   =    isd.subject_name  and
+idd.illness_event  =    isd.stop_event
+)
+group by
+idd.study_guid,
+idd.org_guid,
+idd.org_name,
+idd.site_guid,
+idd.country,
+idd.site_name,
+idd.subject_guid,
+idd.subject_name,
+idd.illnesstart,
+idd.illness,
+idd.illness_event,
+idd.illness_start_date,
+idd.day_1,
+idd.day_2,
+idd.day_3,
+idd.day_4,
+idd.day_5,
+idd.day_6,
+idd.day_7,
+idd.day_8,
+idd.day_9,
+idd.day_10,
+idd.day_11,
+idd.day_12,
+idd.day_13,
+idd.day_14,
+iad.first_ediary_date,
+iad.last_ediary_date,
+tda.last_training_date,
+tda.training_count,
+isd.stop_illness_date,
+isd.completed_month
+)
+/*final select statement*/
+select 
+study_guid as "Study GUID",
+org_guid as "Org GUID",
+org_name,
+site_guid as "Site GUID",
+site_name,
+country,
+subject_guid,
+subject_name,
+illness,
+illness_event,
+to_char(illness_start_date,'DD-Mon-YYYY') as illness_start_date,
+to_char(last_training_date,'DD-Mon-YYYY') as last_training_date,
+training_count,
+to_char(first_ediary_date,'DD-Mon-YYYY') as first_ediary_date,
+to_char(last_ediary_date,'DD-Mon-YYYY') as last_ediary_date,
+to_char(stop_illness_date_1,'DD-Mon-YYYY') as stop_illness_date,
+to_char(stop_illness_date_1,'Month')::text as completed_month,
+current_date as today_date,
+/* case statement to calculate diary completed count*/
+(case when illness_day_1 is not null and   day_1  < current_date then 1 else 0 end +
+case when illness_day_2  is not null and   day_2  < current_date then 1 else 0 end +
+case when illness_day_3  is not null and   day_3  < current_date then 1 else 0 end +
+case when illness_day_4  is not null and   day_4  < current_date then 1 else 0 end +
+case when illness_day_5  is not null and   day_5  < current_date then 1 else 0 end +
+case when illness_day_6  is not null and   day_6  < current_date then 1 else 0 end +
+case when illness_day_7  is not null and   day_7  < current_date then 1 else 0 end +
+case when illness_day_8  is not null and   day_8  < current_date then 1 else 0 end +
+case when illness_day_9  is not null and   day_9  < current_date then 1 else 0 end +
+case when illness_day_10 is not null and   day_10 < current_date then 1 else 0 end +
+case when illness_day_11 is not null and   day_11 < current_date then 1 else 0 end +
+case when illness_day_12 is not null and   day_12 < current_date then 1 else 0 end +
+case when illness_day_13 is not null and   day_13 < current_date then 1 else 0 end +
+case when illness_day_14 is not null and   day_14 < current_date then 1 else 0 end
+) as diary_completed_count, 
+/* case statement to calculate diary missed count*/
+( case when stop_illness_date_1 is not null then (
+case when illness_day_1  is null and day_1  < current_date   and   day_1  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_2  is null and day_2  < current_date   and   day_2  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_3  is null and day_3  < current_date   and   day_3  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_4  is null and day_4  < current_date   and   day_4  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_5  is null and day_5  < current_date   and   day_5  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_6  is null and day_6  < current_date   and   day_6  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_7  is null and day_7  < current_date   and   day_7  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_8  is null and day_8  < current_date   and   day_8  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_9  is null and day_9  < current_date   and   day_9  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_10 is null and day_10 < current_date   and   day_10 <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_11 is null and day_11 < current_date   and   day_11 <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_12 is null and day_12 < current_date   and   day_12 <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_13 is null and day_13 < current_date   and   day_13 <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_14 is null and day_14 < current_date   and   day_14 <= stop_illness_date_1 then 1 else 0 end
+)
+when stop_illness_date_1 is null then (
+case when illness_day_1 is null and    day_1  < current_date then 1 else 0 end +
+case when illness_day_2  is null and   day_2  < current_date then 1 else 0 end +
+case when illness_day_3  is null and   day_3  < current_date then 1 else 0 end +
+case when illness_day_4  is null and   day_4  < current_date then 1 else 0 end +
+case when illness_day_5  is null and   day_5  < current_date then 1 else 0 end +
+case when illness_day_6  is null and   day_6  < current_date then 1 else 0 end +
+case when illness_day_7  is null and   day_7  < current_date then 1 else 0 end +
+case when illness_day_8  is null and   day_8  < current_date then 1 else 0 end +
+case when illness_day_9  is null and   day_9  < current_date then 1 else 0 end +
+case when illness_day_10 is null and   day_10 < current_date then 1 else 0 end +
+case when illness_day_11 is null and   day_11 < current_date then 1 else 0 end +
+case when illness_day_12 is null and   day_12 < current_date then 1 else 0 end +
+case when illness_day_13 is null and   day_13 < current_date then 1 else 0 end +
+case when illness_day_14 is null and   day_14 < current_date then 1 else 0 end 
+) end ) as diary_missed_count,
+
+/* case statement to calculate diary completed count for completed subjects*/
+(case when stop_illness_date_1 is null  then 0 
+when stop_illness_date_1 is not null and stop_illness_date_1 = day_14 and day_14 < current_date then 
+ (case when illness_day_1  is not null and  day_1  < current_date then 1 else 0 end + 
+ case when illness_day_2  is not null and   day_2  < current_date then 1 else 0 end + 
+ case when illness_day_3  is not null and   day_3  < current_date then 1 else 0 end +
+ case when illness_day_4  is not null and   day_4  < current_date then 1 else 0 end + 
+ case when illness_day_5  is not null and   day_5  < current_date then 1 else 0 end + 
+ case when illness_day_6  is not null and   day_6  < current_date then 1 else 0 end + 
+ case when illness_day_7  is not null and   day_7  < current_date then 1 else 0 end + 
+ case when illness_day_8  is not null and   day_8  < current_date then 1 else 0 end +
+ case when illness_day_9  is not null and   day_9  < current_date then 1 else 0 end +
+ case when illness_day_10 is not null and   day_10 < current_date then 1 else 0 end + 
+ case when illness_day_11 is not null and   day_11 < current_date then 1 else 0 end +
+ case when illness_day_12 is not null and   day_12 < current_date then 1 else 0 end + 
+ case when illness_day_13 is not null and   day_13 < current_date then 1 else 0 end + 
+ case when illness_day_14 is not null and   day_14 < current_date then 1 else 0 end 
+ )
+ else 0 
+ end
+  ) as subject_completed_diary_count,
+ /* case statement to calculate diary missed count for completed subjects*/
+ ( case when stop_illness_date_1 is null then 0 
+ when stop_illness_date_1 is not null and stop_illness_date_1 = day_14 and day_14 < current_date then  
+(
+case when illness_day_1  is null and day_1  < current_date   and    day_1  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_2  is null and day_2  < current_date   and    day_2  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_3  is null and day_3  < current_date   and    day_3  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_4  is null and day_4  < current_date   and    day_4  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_5  is null and day_5  < current_date   and    day_5  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_6  is null and day_6  < current_date   and    day_6  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_7  is null and day_7  < current_date   and    day_7  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_8  is null and day_8  < current_date   and    day_8  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_9  is null and day_9  < current_date   and    day_9  <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_10 is null and day_10 < current_date   and    day_10 <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_11 is null and day_11 < current_date   and    day_11 <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_12 is null and day_12 < current_date   and    day_12 <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_13 is null and day_13 < current_date   and    day_13 <= stop_illness_date_1 then 1 else 0 end +
+case when illness_day_14 is null and day_14 < current_date   and    day_14 <= stop_illness_date_1 then 1 else 0 end 
+)
+else 0
+end ) as subject_missed_diary_count,
+/* case statement to calculate days in event for subjects*/
+( case when stop_illness_date_1 is null then (
+case when day_1  < current_date then 1 else  0 end +
+case when day_2  < current_date then 1 else 0 end +
+case when day_3  < current_date then 1 else 0 end +
+case when day_4  < current_date then 1 else 0 end +
+case when day_5  < current_date then 1 else 0 end +
+case when day_6  < current_date then 1 else 0 end +
+case when day_7  < current_date then 1 else 0 end +
+case when day_8  < current_date then 1 else 0 end +
+case when day_9  < current_date then 1 else 0 end +
+case when day_10 < current_date then 1 else 0 end +
+case when day_11 < current_date then 1 else 0 end +
+case when day_12 < current_date then 1 else 0 end +
+case when day_13 < current_date then 1 else 0 end +
+case when day_14 < current_date then 1 else 0 end 
+ )
+when stop_illness_date_1 is not null then (
+case when day_1  <= stop_illness_date_1 and day_1  < current_date   then 1 else  0 end +
+case when day_2  <= stop_illness_date_1 and day_2  < current_date   then 1 else 0 end +
+case when day_3  <= stop_illness_date_1 and day_3  < current_date   then 1 else 0 end +
+case when day_4  <= stop_illness_date_1 and day_4  < current_date   then 1 else 0 end +
+case when day_5  <= stop_illness_date_1 and day_5  < current_date   then 1 else 0 end +
+case when day_6  <= stop_illness_date_1 and day_6  < current_date   then 1 else 0 end +
+case when day_7  <= stop_illness_date_1 and day_7  < current_date   then 1 else 0 end +
+case when day_8  <= stop_illness_date_1 and day_8  < current_date   then 1 else 0 end +
+case when day_9  <= stop_illness_date_1 and day_9  < current_date   then 1 else 0 end +
+case when day_10 <= stop_illness_date_1 and day_10 < current_date   then 1 else 0 end +
+case when day_11 <= stop_illness_date_1 and day_11 < current_date   then 1 else 0 end +
+case when day_12 <= stop_illness_date_1 and day_12 < current_date   then 1 else 0 end +
+case when day_13 <= stop_illness_date_1 and day_13 < current_date   then 1 else 0 end +
+case when day_14 <= stop_illness_date_1 and day_14 < current_date   then 1 else 0 end 
+) end ) as days_in_event,
+case when stop_illness_date_1 is not null and day_1 > stop_illness_date_1 then  'Ended' when day_1 < current_date and illness_day_1  is null then 'Missed'  when day_1 >= current_date  then 'N/A' else 'Completed'  end as illness_day_1,
+case when stop_illness_date_1 is not null and day_2 > stop_illness_date_1 then  'Ended' when day_2 < current_date and illness_day_2  is null then 'Missed'  when day_2 >= current_date  then 'N/A' else 'Completed'  end as illness_day_2,
+case when stop_illness_date_1 is not null and day_3 > stop_illness_date_1 then  'Ended' when day_3 < current_date and illness_day_3  is null then 'Missed'  when day_3 >= current_date  then 'N/A' else 'Completed'  end as illness_day_3,
+case when stop_illness_date_1 is not null and day_4 > stop_illness_date_1 then  'Ended' when day_4 < current_date and illness_day_4  is null then 'Missed'  when day_4 >= current_date  then 'N/A' else 'Completed'  end as illness_day_4,
+case when stop_illness_date_1 is not null and day_5 > stop_illness_date_1 then  'Ended' when day_5 < current_date and illness_day_5  is null then 'Missed'  when day_5 >= current_date  then 'N/A' else 'Completed'  end as illness_day_5,
+case when stop_illness_date_1 is not null and day_6 > stop_illness_date_1 then  'Ended' when day_6 < current_date and illness_day_6  is null then 'Missed'  when day_6 >= current_date  then 'N/A' else 'Completed'  end as illness_day_6,
+case when stop_illness_date_1 is not null and day_7 > stop_illness_date_1 then  'Ended' when day_7 < current_date and illness_day_7  is null then 'Missed'  when day_7 >= current_date  then 'N/A' else 'Completed'  end as illness_day_7,
+case when stop_illness_date_1 is not null and day_8 > stop_illness_date_1 then  'Ended' when day_8 < current_date and illness_day_8  is null then 'Missed'  when day_8 >= current_date  then 'N/A' else 'Completed'  end as illness_day_8,
+case when stop_illness_date_1 is not null and day_9 > stop_illness_date_1 then  'Ended' when day_9 < current_date and illness_day_9  is null then 'Missed'  when day_9 >= current_date  then 'N/A' else 'Completed'  end as illness_day_9,
+case when stop_illness_date_1 is not null and day_10 > stop_illness_date_1 then 'Ended'  when day_10 < current_date and illness_day_10 is null then 'Missed' when day_10 >= current_date then 'N/A' else 'Completed'  end as illness_day_10,
+case when stop_illness_date_1 is not null and day_11 > stop_illness_date_1 then 'Ended'  when day_11 < current_date and illness_day_11 is null then 'Missed' when day_11 >= current_date then 'N/A' else 'Completed'  end as illness_day_11,
+case when stop_illness_date_1 is not null and day_12 > stop_illness_date_1 then 'Ended'  when day_12 < current_date and illness_day_12 is null then 'Missed' when day_12 >= current_date then 'N/A' else 'Completed'  end as illness_day_12,
+case when stop_illness_date_1 is not null and day_13 > stop_illness_date_1 then 'Ended'  when day_13 < current_date and illness_day_13 is null then 'Missed' when day_13 >= current_date then 'N/A' else 'Completed'  end as illness_day_13,
+case when stop_illness_date_1 is not null and day_14 > stop_illness_date_1 then 'Ended'  when day_14 < current_date and illness_day_14 is null then 'Missed' when day_14 >= current_date then 'N/A' else 'Completed'  end as illness_day_14
+from report_data ORDER BY subject_name, illness_start_date, illness_event
